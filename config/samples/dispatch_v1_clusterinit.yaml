@@ -1,0 +1,22 @@
+apiVersion: dispatch.ec2-launchpad.io/v1
+kind: ClusterInit
+metadata:
+  labels:
+    app.kubernetes.io/name: ec2-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: clusterinit-sample
+spec:
+  awsSecret: aws-credentials
+  awsRegion: us-east-1
+  noOfInstance: 3
+  instanceTypes:
+    - t3.medium
+    - t3.large
+  storage: 50
+  cni: flannel
+  uuid: 7f3b2c1a-6d4e-4f89-9b21-8c5a7e6d4f10
+  gateway: 10.0.0.1
+  ingress: nginx
+  addons:
+    - helm
+    - metrics-server
