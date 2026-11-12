@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -36,10 +35,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 
-	// "k8s.io/client-go/metadata"
 	"encoding/json"
 
-	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -331,13 +328,8 @@ func (r *ClusterInitReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	clusterSpec := launcher.Spec
 	clusterStatus := launcher.Status
 	Namespace := launcher.Namespace
-	home, _ := os.UserHomeDir()
-	kubeConfigPath := filepath.Join(home, ".kube/config")
-	config, err := clientcmd.BuildConfigFromFlags("", kubeConfigPath)
-	if err != nil {
-		panic(err.Error())
-	}
-	client := kubernetes.NewForConfigOrDie(config)
+	client := kubernetes.NewForConfigOrDie(ctrl.GetConfigOrDie())
+	var err error
 	cli := client.CoreV1()
 	envList := []v1.EnvVar{}
 	var AWS_ACCESS_KEY_ID string = os.Getenv("AWS_ACCESS_KEY_ID")
