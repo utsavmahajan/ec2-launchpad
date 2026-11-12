@@ -64,6 +64,9 @@ spec:
                 type: boolean
               ingress:
                 type: string
+              managedBy:
+                default: k8-launcher
+                type: string
               noOfWorkerNodeInstance:
                 maximum: 5
                 minimum: 0
@@ -91,6 +94,7 @@ spec:
             - gateway
             - helm
             - ingress
+            - managedBy
             - noOfWorkerNodeInstance
             - randomSTR
             - roleARN
@@ -186,6 +190,9 @@ spec:
                   - "Progressing": the resource is being created or updated
                   - "Degraded": the resource failed to reach or maintain its desired state
                 type: boolean
+              roleBindingCreated:
+                default: false
+                type: boolean
               secretCreated:
                 default: false
                 type: boolean
@@ -204,6 +211,7 @@ spec:
             - cmForIPCreated
             - controlNodeCreated
             - podCreated
+            - roleBindingCreated
             - secretCreated
             - sgCreated
             - sshKeyCreated

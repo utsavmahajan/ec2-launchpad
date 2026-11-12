@@ -64,6 +64,22 @@ spec:
           - --leader-elect
           - --health-probe-bind-address=:8081
         image: controller:latest
+        env:
+          - name: AWS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef:
+                name: ec2-operator-secrets
+                key: AWS_ACCESS_KEY_ID
+          - name: AWS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: ec2-operator-secrets
+                key: AWS_SECRET_ACCESS_KEY
+          - name: DATABASE_URL
+            valueFrom:
+              secretKeyRef:
+                name: ec2-operator-secrets
+                key: DATABASE_URL
         name: manager
         ports:
         - containerPort: 8081

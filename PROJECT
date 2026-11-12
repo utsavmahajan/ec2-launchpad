@@ -6,6 +6,8 @@ cliVersion: 4.16.0
 domain: ec2-launchpad.io
 layout:
 - go.kubebuilder.io/v4
+plugins:
+  helm.kubebuilder.io/v1-alpha: {}
 projectName: ec2-operator
 repo: github.com/utsavmahajan/ec2-launchpad
 resources:

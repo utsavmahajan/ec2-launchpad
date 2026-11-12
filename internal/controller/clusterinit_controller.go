@@ -28,6 +28,7 @@ import (
 	dispatchv1 "github.com/utsavmahajan/ec2-launchpad/api/v1"
 	batch "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -36,13 +37,40 @@ import (
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 
 	// "k8s.io/client-go/metadata"
+	"encoding/json"
+
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"encoding/json"
 )
+
+func (r *ClusterInitReconciler) CreateRoleBinding(ctx context.Context, cli corev1.CoreV1Interface, Namespace string) error {
+	rb := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default-sa-binding",
+			Namespace: Namespace,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      "default",
+				Namespace: Namespace,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "admin",
+		},
+	}
+
+	if err := r.Create(ctx, rb); err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	return nil
+}
 
 func CreateCM(ctx context.Context, cli corev1.CoreV1Interface, clusterSpec dispatchv1.ClusterInitSpec, Namespace string) error {
 	Name := clusterSpec.UserName + "-" + clusterSpec.RandomSTR
@@ -70,10 +98,10 @@ func CreateCM(ctx context.Context, cli corev1.CoreV1Interface, clusterSpec dispa
 	return err
 }
 
-func createCMforInstanceType(ctx context.Context, cli corev1.CoreV1Interface, Namespace string,data string) error {
+func createCMforInstanceType(ctx context.Context, cli corev1.CoreV1Interface, Namespace string, data string) error {
 	Name := "instancetypes"
 	datamap := make(map[string]string)
-	if err := json.Unmarshal([]byte(data),&datamap); err != nil{
+	if err := json.Unmarshal([]byte(data), &datamap); err != nil {
 		return err
 	}
 	cmDefinition := &v1.ConfigMap{
@@ -109,6 +137,18 @@ func createPod(ctx context.Context, cli corev1.CoreV1Interface, clusterSpec disp
 	podCli := cli.Pods(Namespace)
 	Name := strings.ToLower(clusterSpec.UserName + "-" + clusterSpec.RandomSTR)
 	volumeName := "cluster-spec"
+	var AWS_ACCESS_KEY_ID string = os.Getenv("AWS_ACCESS_KEY_ID")
+	if AWS_ACCESS_KEY_ID == "" {
+		return errors.New("AWS Access Key can't Be Empty")
+	}
+	var AWS_SECRET_ACCESS_KEY string = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	if AWS_SECRET_ACCESS_KEY == "" {
+		return errors.New("AWS Access Secret Key can't Be Empty")
+	}
+	var DATABASE_URL string = os.Getenv("DATABASE_URL")
+	if DATABASE_URL == "" {
+		return errors.New("Database Conn String Can't Be Empty")
+	}
 
 	podDefinition := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -130,21 +170,20 @@ func createPod(ctx context.Context, cli corev1.CoreV1Interface, clusterSpec disp
 			},
 			Containers: []v1.Container{
 				{
-					Name:    Name,
-					Image:   "nginx",
-					Command: []string{"sh", "-c", "sleep 1d"},
+					Name:  Name,
+					Image: "utsav5/ec2-launcher:v11",
 					Env: []v1.EnvVar{
 						{
-							Name: "DATABASESTR",
-							Value: "",
+							Name:  "DATABASE_URL",
+							Value: DATABASE_URL,
 						},
 						{
-							Name: "AWS_ACCESS_KEY_ID",
-							Value: "",
+							Name:  "AWS_ACCESS_KEY_ID",
+							Value: AWS_ACCESS_KEY_ID,
 						},
 						{
-							Name: "AWS_SECRET_ACCESS_KEY",
-							Value: "",
+							Name:  "AWS_SECRET_ACCESS_KEY",
+							Value: AWS_SECRET_ACCESS_KEY,
 						},
 						{
 							Name:  "ROLEARN",
@@ -172,6 +211,14 @@ func createPod(ctx context.Context, cli corev1.CoreV1Interface, clusterSpec disp
 								FieldRef: &v1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
 							},
 						},
+						{
+							Name:  "DISPATCH_NAME",
+							Value: Name,
+						},
+						{
+							Name:  "CLUSTER_NAME",
+							Value: Name,
+						},
 					},
 					VolumeMounts: []v1.VolumeMount{
 						{
@@ -187,11 +234,9 @@ func createPod(ctx context.Context, cli corev1.CoreV1Interface, clusterSpec disp
 	return err
 }
 
-func createJob(ctx context.Context, client *kubernetes.Clientset, Namespace string, clusterSpec dispatchv1.ClusterInitSpec) (error, bool) {
+func createJob(ctx context.Context, client *kubernetes.Clientset, Namespace string, envList []v1.EnvVar) (error, bool) {
 	jobcli := client.BatchV1().Jobs(Namespace)
 	Name := "deleteinstancejob"
-	cmName := strings.ToLower(clusterSpec.UserName + "-" + clusterSpec.RandomSTR)
-	volumeName := "cluster-spec"
 	backoffLimit := int32(2)
 
 	jobDefinition := &batch.Job{
@@ -203,29 +248,11 @@ func createJob(ctx context.Context, client *kubernetes.Clientset, Namespace stri
 			BackoffLimit: &backoffLimit,
 			Template: v1.PodTemplateSpec{
 				Spec: v1.PodSpec{
-					Volumes: []v1.Volume{
-						{
-							Name: volumeName,
-							VolumeSource: v1.VolumeSource{
-								ConfigMap: &v1.ConfigMapVolumeSource{
-									LocalObjectReference: v1.LocalObjectReference{
-										Name: cmName,
-									},
-								},
-							},
-						},
-					},
 					Containers: []v1.Container{
 						{
-							Name:    Name,
-							Image:   "busybox",
-							Command: []string{"sh", "-c", "sleep 120"},
-							VolumeMounts: []v1.VolumeMount{
-								{
-									Name:      volumeName,
-									MountPath: "/values",
-								},
-							},
+							Name:  Name,
+							Image: "utsav5/delete-job:v3",
+							Env:   envList,
 						},
 					},
 					RestartPolicy: v1.RestartPolicyNever,
@@ -238,7 +265,7 @@ func createJob(ctx context.Context, client *kubernetes.Clientset, Namespace stri
 		return err, false
 	}
 
-	err := wait.PollUntilContextTimeout(ctx, 3*time.Second, 5*time.Minute, true,
+	err := wait.PollUntilContextTimeout(ctx, 3*time.Second, 12*time.Minute, true,
 		func(ctx context.Context) (bool, error) {
 			j, err := jobcli.Get(ctx, Name, metav1.GetOptions{})
 			if err != nil {
@@ -268,7 +295,10 @@ type ClusterInitReconciler struct {
 // +kubebuilder:rbac:groups=dispatch.ec2-launchpad.io,resources=clusterinits,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=dispatch.ec2-launchpad.io,resources=clusterinits/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=dispatch.ec2-launchpad.io,resources=clusterinits/finalizers,verbs=update
-
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;delete
+// +kubebuilder:subresource:status
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 // TODO(user): Modify the Reconcile function to compare the state specified by
@@ -309,11 +339,92 @@ func (r *ClusterInitReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	client := kubernetes.NewForConfigOrDie(config)
 	cli := client.CoreV1()
+	envList := []v1.EnvVar{}
+	var AWS_ACCESS_KEY_ID string = os.Getenv("AWS_ACCESS_KEY_ID")
+	if AWS_ACCESS_KEY_ID == "" {
+		return ctrl.Result{}, errors.New("AWS Access Key can't Be Empty")
+	}
+	var AWS_SECRET_ACCESS_KEY string = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	if AWS_SECRET_ACCESS_KEY == "" {
+		return ctrl.Result{}, errors.New("AWS Access Secret Key can't Be Empty")
+	}
+	var DATABASE_URL string = os.Getenv("DATABASE_URL")
+	if DATABASE_URL == "" {
+		return ctrl.Result{}, errors.New("Database Conn String Can't Be Empty")
+	}
 	if !launcher.DeletionTimestamp.IsZero() {
-		err, status := createJob(ctx, client, Namespace, clusterSpec)
+		if launcher.Spec.ManagedBy == "k8-launcher" {
+			envList = []v1.EnvVar{
+				{
+					Name:  "AWS_ACCESS_KEY_ID",
+					Value: AWS_ACCESS_KEY_ID,
+				},
+				{
+					Name:  "AWS_SECRET_ACCESS_KEY",
+					Value: AWS_SECRET_ACCESS_KEY,
+				},
+				{
+					Name:  "AWSREGION",
+					Value: clusterSpec.AWSRegion,
+				},
+				{
+					Name:  "DATABASE_URL",
+					Value: DATABASE_URL,
+				},
+				{
+					Name:  "UUID",
+					Value: clusterSpec.UUID,
+				},
+				{
+					Name:  "RANDOMCODE",
+					Value: clusterSpec.RandomSTR,
+				},
+				{
+					Name:  "NAMESPACE",
+					Value: Namespace,
+				},
+				{
+					Name:  "Cluster_Name",
+					Value: clusterSpec.UserName + "-" + clusterSpec.RandomSTR,
+				},
+				{
+					Name:  "ROLEARN",
+					Value: clusterSpec.RoleARN,
+				},
+				{
+					Name:  "EXTERNALID",
+					Value: clusterSpec.ExternalID,
+				},
+			}
+		} else {
+			envList = []v1.EnvVar{
+				{
+					Name:  "DATABASE_URL",
+					Value: DATABASE_URL,
+				},
+				{
+					Name:  "UUID",
+					Value: clusterSpec.UUID,
+				},
+				{
+					Name:  "RANDOMCODE",
+					Value: clusterSpec.RandomSTR,
+				},
+				{
+					Name:  "NAMESPACE",
+					Value: Namespace,
+				},
+				{
+					Name:  "Cluster_Name",
+					Value: clusterSpec.UserName + "-" + clusterSpec.RandomSTR,
+				},
+			}
+		}
+		err, status := createJob(ctx, client, Namespace, envList)
 		if err != nil || status == false {
 			l.Error(err, "Failed To Complete the JOB")
 		}
+		time.Sleep(time.Minute * 2)
 		if status == true {
 			if err := cli.Namespaces().Delete(ctx, Namespace, metav1.DeleteOptions{}); err != nil {
 				l.Error(err, "Failed To Delete The Namespace")
@@ -327,6 +438,18 @@ func (r *ClusterInitReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return ctrl.Result{}, nil
 		}
 	}
+
+	if clusterStatus.RoleBindingCreated == false {
+		if createErr := r.CreateRoleBinding(ctx, cli, Namespace); createErr != nil {
+			l.Error(err, "Failed To Create A Role Binding")
+			return ctrl.Result{}, err
+		}
+		launcher.Status.RoleBindingCreated = true
+		if err := r.Status().Update(ctx, launcher); err != nil {
+			l.Error(err, "Failed To Edit the status")
+		}
+	}
+
 	if clusterStatus.CMCreated == false {
 		if createErr := CreateCM(ctx, cli, clusterSpec, Namespace); createErr != nil {
 			l.Error(createErr, "Failed to create ConfigMap from the given spec")
@@ -357,8 +480,8 @@ func (r *ClusterInitReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			l.Error(err, "Failed To Edit the status")
 		}
 	}
-	if clusterStatus.CMForIPCreated == false{
-		if createErr := createCMforInstanceType(ctx,cli,Namespace,clusterSpec.WorkerNodeInstanceTypes); createErr != nil{
+	if clusterStatus.CMForIPCreated == false {
+		if createErr := createCMforInstanceType(ctx, cli, Namespace, clusterSpec.WorkerNodeInstanceTypes); createErr != nil {
 			l.Error(createErr, "Failed to create ConfigMap from the given spec")
 			return ctrl.Result{}, createErr
 		}
@@ -377,3 +500,7 @@ func (r *ClusterInitReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Named("clusterinit").
 		Complete(r)
 }
+
+// k logs -n k
+// k get po -n 5aa319e3-e413-4635-8f11-6551257a0212-abcde
+// kubectl patch clusterinit test-user-abcde -n 5aa319e3-e413-4635-8f11-6551257a0212-abcde   --type=merge -p '{"metadata":{"finalizers":null}}'

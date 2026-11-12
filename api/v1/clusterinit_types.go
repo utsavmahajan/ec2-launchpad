@@ -55,6 +55,8 @@ type ClusterInitSpec struct {
 	Helm bool `json:"helm"`
 	// +kubebuilder:default:=false
 	Crictl bool `json:"crictl"`
+	// +kubebuilder:default:=k8-launcher
+	ManagedBy string `json:"managedBy"`
 	// +kubebuilder:default:=c7i-flex.large
 	ControlNodeType string `json:"controlNodeType"`
 	Gateway string `json:"gateway"`
@@ -79,6 +81,8 @@ type ClusterInitStatus struct {
 	// - "Degraded": the resource failed to reach or maintain its desired state
     // +kubebuilder:default:=false
 	PodCreated bool `json:"podCreated"`
+    // +kubebuilder:default:=false
+	RoleBindingCreated bool `json:"roleBindingCreated"`
     // +kubebuilder:default:=false
 	CMCreated bool `json:"cmCreated"`
     // +kubebuilder:default:=false
