@@ -7,7 +7,9 @@ domain: ec2-launchpad.io
 layout:
 - go.kubebuilder.io/v4
 plugins:
-  helm.kubebuilder.io/v1-alpha: {}
+  helm.kubebuilder.io/v2-alpha:
+    manifests: dist/install.yaml
+    output: dist
 projectName: ec2-operator
 repo: github.com/utsavmahajan/ec2-launchpad
 resources:
