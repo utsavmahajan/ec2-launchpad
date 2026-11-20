@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Grants MyApp limited, tag-scoped permission to launch and manage EC2 instances
+  (with Session Manager access, no SSH keys) in this account.
+
+Parameters:
+  TrustedAccountId:
+    Type: String
+    Description: MyApp's AWS account ID (provided by MyApp)
+    AllowedPattern: '^\d{12}$'
+  ExternalId:
+    Type: String
+    Description: Unique ExternalId (provided by MyApp)
+    MinLength: 16
+    NoEcho: true
+  AllowedRegions:
+    Type: CommaDelimitedList
+    Default: us-east-1
+    Description: Regions MyApp may operate in (comma separated)
+  ManagedTagValue:
+    Type: String
+    Default: myapp
+    Description: Value of the "managed-by" tag. MyApp can only touch resources carrying it.
+
+Resources:
+  # ---------------------------------------------------------------
+  # Role MyApp assumes (via sts:AssumeRole + ExternalId)
+  # ---------------------------------------------------------------
+  MyAppAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MyAppAccessRole
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${TrustedAccountId}:root
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+      Policies:
+        - PolicyName: MyAppEc2Management
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Read-only lookups (describe APIs don't support resource scoping)
+              - Sid: ReadOnlyLookups
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeImages
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeKeyPairs
+                  - ec2:DescribeTags
+                  - ec2:DescribeAvailabilityZones
+                  - ssm:DescribeInstanceInformation
+                  - ssm:DescribeSessions
+                Resource: "*"
+
+              # AMI lookup via public SSM parameters
+              - Sid: AmiParameterLookup
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:aws:ssm:*::parameter/aws/service/ami-amazon-linux-latest/*
+
+              # RunInstances: shared resources (no tag requirement possible)
+              - Sid: RunInstancesSharedResources
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub arn:aws:ec2:*::image/*
+                  - !Sub arn:aws:ec2:*:${AWS::AccountId}:subnet/*
+                  - !Sub arn:aws:ec2:*:${AWS::AccountId}:network-interface/*
+                  - !Sub arn:aws:ec2:*:${AWS::AccountId}:security-group/*
+                  - !Sub arn:aws:ec2:*:${AWS::AccountId}:key-pair/*
+
+              # RunInstances: instances and volumes must be tagged at creation
+              - Sid: RunInstancesTaggedResources
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub arn:aws:ec2:*:${AWS::AccountId}:instance/*
+                  - !Sub arn:aws:ec2:*:${AWS::AccountId}:volume/*
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/managed-by: !Ref ManagedTagValue
+
+              # Tagging only allowed at creation time
+              - Sid: TagOnCreateOnly
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub arn:aws:ec2:*:${AWS::AccountId}:*/*
+                Condition:
+                  StringEquals:
+                    ec2:CreateAction:
+                      - RunInstances
+                      - CreateVolume
+                      - CreateSecurityGroup
+                      - CreateKeyPair
+
+              # SSH key pairs: create (tagged) for Ansible access
+              - Sid: CreateKeyPairTagged
+                Effect: Allow
+                Action: ec2:CreateKeyPair
+                Resource: !Sub arn:aws:ec2:*:${AWS::AccountId}:key-pair/*
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/managed-by: !Ref ManagedTagValue
+
+              # Security groups: create (tagged) in any VPC
+              - Sid: CreateSecurityGroupVpc
+                Effect: Allow
+                Action: ec2:CreateSecurityGroup
+                Resource: !Sub arn:aws:ec2:*:${AWS::AccountId}:vpc/*
+              - Sid: CreateSecurityGroupTagged
+                Effect: Allow
+                Action: ec2:CreateSecurityGroup
+                Resource: !Sub arn:aws:ec2:*:${AWS::AccountId}:security-group/*
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/managed-by: !Ref ManagedTagValue
+
+              # Standalone volumes (only if you create them outside RunInstances)
+              - Sid: CreateVolumeTagged
+                Effect: Allow
+                Action: ec2:CreateVolume
+                Resource: !Sub arn:aws:ec2:*:${AWS::AccountId}:volume/*
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/managed-by: !Ref ManagedTagValue
+
+              # Mutating actions: only on resources MyApp created
+              - Sid: ManageTaggedResources
+                Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:RebootInstances
+                  - ec2:TerminateInstances
+                  - ec2:AttachVolume
+                  - ec2:DetachVolume
+                  - ec2:DeleteVolume
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:DeleteSecurityGroup
+                  - ec2:DeleteKeyPair
+                Resource: !Sub arn:aws:ec2:*:${AWS::AccountId}:*/*
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/managed-by: !Ref ManagedTagValue
+
+              # Session Manager (replaces SSH keys)
+              - Sid: SessionManager
+                Effect: Allow
+                Action: ssm:StartSession
+                Resource:
+                  - !Sub arn:aws:ec2:*:${AWS::AccountId}:instance/*
+                  - !Sub arn:aws:ssm:*:*:document/AWS-StartSSHSession
+                  - !Sub arn:aws:ssm:*:*:document/SSM-SessionManagerRunShell
+                Condition:
+                  StringEquals:
+                    ssm:resourceTag/managed-by: !Ref ManagedTagValue
+              - Sid: EndOwnSessions
+                Effect: Allow
+                Action:
+                  - ssm:TerminateSession
+                  - ssm:ResumeSession
+                Resource: arn:aws:ssm:*:*:session/${aws:userid}-*
+
+              # Allow attaching ONLY the SSM instance profile role to instances
+              - Sid: PassInstanceRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt InstanceRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ec2.amazonaws.com
+
+              # Guardrail: nothing outside approved regions
+              - Sid: DenyOutsideAllowedRegions
+                Effect: Deny
+                Action:
+                  - ec2:*
+                  - ssm:*
+                Resource: "*"
+                Condition:
+                  StringNotEquals:
+                    aws:RequestedRegion: !Ref AllowedRegions
+
+  # ---------------------------------------------------------------
+  # Role + instance profile attached to launched EC2 instances so
+  # the SSM agent can register (Session Manager, no SSH needed)
+  # ---------------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MyAppInstanceRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: MyAppInstanceProfile
+      Roles:
+        - !Ref InstanceRole
+
+Outputs:
+  RoleArn:
+    Description: Send this Role ARN to MyApp
+    Value: !GetAtt MyAppAccessRole.Arn
+  InstanceProfileArn:
+    Description: Used by MyApp when launching instances (IamInstanceProfile)
+    Value: !GetAtt InstanceProfile.Arn

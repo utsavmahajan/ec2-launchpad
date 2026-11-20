@@ -3,5 +3,5 @@ name: ec2-operator
 description: A Helm chart to distribute the project ec2-operator
 type: application
 version: 0.1.0
-appVersion: "v1"
-# icon: "https://example.com/icon.png"
+appVersion: "0.1.0"
+icon: "https://example.com/icon.png"

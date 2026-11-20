@@ -1,135 +1,183 @@
-# ec2-operator
-// TODO(user): Add simple overview of use/purpose
+# ec2-launchpad
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Kubernetes operator that turns a `ClusterInit` custom resource into a working kubeadm cluster on AWS EC2, from nothing to a running cluster in about 10-15 minutes.
 
-## Getting Started
+You declare the cluster you want (node types, worker count, CNI, ingress, addons), and the operator launches the infrastructure in **your own AWS account** using cross-account STS AssumeRole, bootstraps it with Ansible, monitors node health, and cleans up every AWS resource when you delete the resource.
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+> **Project status: core complete, product incomplete.**
+> The operator and its workloads are functional end to end. The backend and frontend that would make this a self-service product are not built yet. See [Status and roadmap](#status-and-roadmap).
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+Related repos: [`k8-project`](https://github.com/utsavmahajan/k8-project) (provisioner, bootstrap, watcher and teardown workloads) and [`ansible-scripts`](https://github.com/utsavmahajan/ansible-scripts) (cluster bootstrap playbooks).
 
-```sh
-make docker-build docker-push IMG=<some-registry>/ec2-operator:tag
+## How it works
+
+```
+ ClusterInit (CR)  ──►  Operator  ──►  provisioner pod  ──►  EC2 instances in your AWS account
+                          │                  │
+                          │                  ├─►  Ansible Job  ──►  kubeadm cluster + CNI/ingress/addons
+                          │                  └─►  watcher pods ──►  health checks, dead-node cleanup
+                          │
+                          └─►  finalizer  ──►  delete Job  ──►  terminates instances, key pair, security group
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+The operator adds a finalizer, creates a RoleBinding, a ConfigMap holding the spec, a Secret and the provisioner pod, and records each step in the CR status so reconciles are idempotent. When the CR is deleted, the finalizer runs a teardown Job before the namespace is removed.
 
-**Install the CRDs into the cluster:**
+## Prerequisites
 
-```sh
-make install
+- A Kubernetes cluster you can administer, with `kubectl` and `helm` installed
+- An AWS account where the clusters will be created
+- A PostgreSQL database reachable from the cluster, with a `clusterinfo` table (`user_id`, `random_code`, `instance_public_ip`, `role`)
+- AWS credentials for the operator to use when assuming your role
+
+## Setup
+
+### 1. Create the IAM role in your AWS account
+
+This repo contains a CloudFormation template (`cloudformation/` directory; use the template file in that folder). Run it in **your own AWS account** from the CloudFormation console or CLI.
+
+It creates the IAM role that the operator assumes through STS. Once the stack finishes, note two values from the stack:
+
+- the **Role ARN**, which goes in `roleARN` in your `ClusterInit`
+- the **External ID** you chose, which goes in `externalID`
+
+### 2. Create the operator namespace and secret
+
+```bash
+kubectl create namespace ec2-operator-system
+
+kubectl create secret generic ec2-operator-secrets -n ec2-operator-system \
+  --from-literal=AWS_ACCESS_KEY_ID=<your-access-key-id> \
+  --from-literal=AWS_SECRET_ACCESS_KEY=<your-secret-access-key> \
+  --from-literal=DATABASE_URL=<your-postgres-connection-string>
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+### 3. Grant permissions on the custom resource
 
-```sh
-make deploy IMG=<some-registry>/ec2-operator:tag
+This ClusterRole aggregates into the built-in `admin` role, so namespace admins can manage `ClusterInit` resources:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: clusterinit-aggregate-to-admin
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+rules:
+- apiGroups: ["dispatch.ec2-launchpad.io"]
+  resources: ["clusterinits"]
+  verbs: ["*"]
+- apiGroups: ["dispatch.ec2-launchpad.io"]
+  resources: ["clusterinits/status"]
+  verbs: ["*"]
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+Save it to a file and apply it with `kubectl apply -f`. Then bind the operator's ServiceAccount to the `admin` role:
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
-```sh
-kubectl apply -k config/samples/
+```bash
+kubectl create clusterrolebinding requiredpermisions \
+  --clusterrole=admin \
+  --serviceaccount=ec2-operator-system:ec2-operator-controller-manager
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+> This binding is broader than it needs to be. See [Known limitations](#known-limitations).
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+### 4. Install the operator
 
-```sh
-kubectl delete -k config/samples/
+```bash
+helm install ec2-operator oci://registry-1.docker.io/utsav5/ec2-operator \
+  --version 0.1.0 -n ec2-operator-system
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+Check that it's running:
 
-```sh
-make uninstall
+```bash
+kubectl get pods -n ec2-operator-system
 ```
 
-**UnDeploy the controller from the cluster:**
+## Creating a cluster
 
-```sh
-make undeploy
+Each `ClusterInit` lives in its own namespace, which the operator deletes again on teardown. Create the namespace first, then apply the resource.
+
+```bash
+kubectl create namespace 5aa319e3-e413-4635-8f11-6551257a0212-abcde
 ```
 
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/ec2-operator:tag
+```yaml
+apiVersion: dispatch.ec2-launchpad.io/v1
+kind: ClusterInit
+metadata:
+  name: test-user-abcde
+  namespace: 5aa319e3-e413-4635-8f11-6551257a0212-abcde
+spec:
+  roleARN: arn:aws:iam::XXXXXXXX:role/MyAppAccessRole
+  externalID: abcde
+  awsRegion: us-east-1
+  controlNodeType: c7i-flex.large
+  storage: 15
+  workerNodeinstanceTypes: '{"worker-1":"c7i-flex.large","worker-2":"c7i-flex.large"}'
+  userName: test-user
+  randomSTR: abcde
+  cni: cilium
+  uuid: 5aa319e3-e413-4635-8f11-6551257a0212
+  ingress: nginx-ingress
+  gateway: ""
+  helm: true
+  crictl: false
+  noOfWorkerNodeInstance: 1
+  addons:
+    - etcdctl
+    - metrics-server
 ```
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
+Apply it with `kubectl apply -f` and watch progress with `kubectl get clusterinit -A -w` and `kubectl get pods -n <namespace>`.
 
-2. Using the installer
+> **This example is not the intended user experience.**
+> The `ClusterInit` was never meant to be written by hand. It was designed to be generated by a backend and frontend: a user would enter their Role ARN, External ID and cluster options in a form, and the backend would create the resource. That's why it has fields like `uuid`, `userName` and `randomSTR`, which identify the user and request and are meant to be filled in by a backend. When creating one manually, any unique values will do.
 
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
+### Spec reference
 
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/ec2-operator/<tag or branch>/dist/install.yaml
+| Field | Description |
+|---|---|
+| `roleARN`, `externalID` | The IAM role from the CloudFormation stack and its External ID |
+| `awsRegion` | AWS region for the cluster |
+| `controlNodeType` | EC2 instance type for the control-plane node |
+| `workerNodeinstanceTypes` | JSON map of worker name to instance type |
+| `noOfWorkerNodeInstance` | Worker count passed to the provisioner as configuration |
+| `storage` | Root volume size (GB) |
+| `cni` | `flannel`, `calico` or `cilium` |
+| `ingress` | `nginx-ingress` or `traefik` (see `ansible-scripts` for exact names) |
+| `gateway` | Gateway API implementation (`nginx-gateway`), or empty for none |
+| `helm`, `crictl` | Install Helm / crictl on the nodes |
+| `addons` | Extra installs, such as `metrics-server` and `etcdctl` |
+| `userName`, `randomSTR`, `uuid` | Identifiers used for naming and database tracking; meant to be set by a backend |
+
+### Deleting a cluster
+
+```bash
+kubectl delete clusterinit test-user-abcde -n 5aa319e3-e413-4635-8f11-6551257a0212-abcde
 ```
 
-### By providing a Helm Chart
+The finalizer runs a teardown Job that terminates the EC2 instances and deletes the key pair, security group and database rows, then removes the namespace.
 
-1. Build the chart using the optional helm plugin
+## Known limitations
 
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
+This is an early version, and these gaps are known:
 
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
+- **Overly permissive ClusterRoleBinding.** The operator's ServiceAccount is bound to `admin`, and the default ServiceAccount in each cluster namespace gets `admin` as well.
+- **No backend or frontend.** Clusters are created by applying YAML by hand, which was never the intended experience.
+- **No unit tests.**
+- **No proper error handling.** Some failures are only logged and don't requeue, and several waits are fixed sleeps rather than readiness checks.
+- Credentials are passed to workloads as plain env vars rather than Secret references.
+- The generated security group opens SSH and other ports to `0.0.0.0/0`.
+- Only `us-east-1` has an AMI configured.
 
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
+## Status and roadmap
 
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
+The core structure is in place: the CRD, reconciliation with finalizers, AWS provisioning, Ansible bootstrap, health watchers and teardown. The next version is planned to address the limitations above:
 
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
-## License
-
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+- [ ] A backend API and frontend so users enter their details in a form instead of writing YAML
+- [ ] Least-privilege RBAC in place of the broad `admin` bindings
+- [ ] Unit and integration tests
+- [ ] Proper error handling, requeue behavior and readiness checks
+- [ ] Secrets handled through Kubernetes Secret references
+- [ ] Multi-region support
